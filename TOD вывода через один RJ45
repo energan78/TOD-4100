@@ -1,0 +1,299 @@
+#include <WiFi.h>
+#include <time.h>
+
+const char* ssid = "izm-22";
+const char* password = "80577561578";
+
+const char* ntpServer = "31.202.14.125";
+const long gmtOffset_sec = 0;
+const int daylightOffset_sec = 0;
+
+// Пины для PPS и TOD вывода через один RJ45
+const int ppsPin = 4;
+
+// Пины для мультиплексированного TOD вывода
+const int todData0 = 12;  // DATA BIT 0
+const int todData1 = 13;  // DATA BIT 1  
+const int todData2 = 14;  // DATA BIT 2
+const int todData3 = 15;  // DATA BIT 3
+const int todData4 = 16;  // DATA BIT 4
+const int todData5 = 17;  // DATA BIT 5
+const int todData6 = 18;  // DATA BIT 6
+const int todData7 = 19;  // DATA BIT 7
+const int todStrobe = 21; // Строб-сигнал данных
+const int todSelect = 22; // Выбор времени/даты (0=время, 1=дата)
+
+// Переменные для стабильной работы
+volatile unsigned long lastPpsMicros = 0;
+volatile unsigned long ppsCounter = 0;
+volatile bool ppsReceived = false;
+volatile unsigned long lastStablePps = 0;
+
+bool externalClockActive = false;
+unsigned long lastNtpSync = 0;
+unsigned long stablePpsCount = 0;
+float averageInterval = 1000000.0;
+
+// Структура для полных TOD данных
+struct TodData {
+  // Время
+  uint8_t hours;
+  uint8_t minutes; 
+  uint8_t seconds;
+  uint16_t milliseconds;
+  
+  // Дата
+  uint8_t day;
+  uint8_t month;
+  uint16_t year;
+  uint8_t dayOfWeek;
+  
+  // Статус
+  uint32_t ppsCounter;
+  bool ppsLocked;
+};
+
+void IRAM_ATTR ppsInterrupt() {
+  unsigned long currentMicros = micros();
+  unsigned long interval = currentMicros - lastPpsMicros;
+  
+  if (lastPpsMicros > 0) {
+    if (interval > 800000 && interval < 1200000) {
+      averageInterval = (averageInterval * 0.9) + (interval * 0.1);
+      lastStablePps = currentMicros;
+      stablePpsCount++;
+    }
+  }
+  
+  lastPpsMicros = currentMicros;
+  ppsCounter++;
+  ppsReceived = true;
+}
+
+void updateTimeFromPps() {
+  struct timeval tv;
+  if (gettimeofday(&tv, NULL) == 0) {
+    tv.tv_sec += 1;
+    tv.tv_usec = 0;
+    settimeofday(&tv, NULL);
+  }
+}
+
+void outputTodSerial(const TodData& tod) {
+  // Полный вывод с датой и временем
+  Serial.printf("📅 TOD: %04d-%02d-%02d %02d:%02d:%02d.%03d", 
+               tod.year, tod.month, tod.day,
+               tod.hours, tod.minutes, tod.seconds, tod.milliseconds);
+  
+  Serial.printf(" [DoW: %d]", tod.dayOfWeek);
+  
+  if (tod.ppsLocked) {
+    Serial.printf(" [PPS #%lu] ✅", tod.ppsCounter);
+    
+    float drift = (averageInterval - 1000000.0) / 1000.0;
+    if (fabs(drift) > 0.5) {
+      Serial.printf(" Drift: %.1fms", drift);
+    }
+  } else {
+    Serial.printf(" [FREE #%lu] ⚠️", tod.ppsCounter);
+  }
+  
+  if (stablePpsCount > 0) {
+    Serial.printf(" Stable: %lu", stablePpsCount);
+  }
+  
+  Serial.println();
+}
+
+void outputDataToBus(uint16_t data) {
+  // Вывод 8-битных данных на шину
+  digitalWrite(todData0, (data & 0x01) ? HIGH : LOW);
+  digitalWrite(todData1, (data & 0x02) ? HIGH : LOW);
+  digitalWrite(todData2, (data & 0x04) ? HIGH : LOW);
+  digitalWrite(todData3, (data & 0x08) ? HIGH : LOW);
+  digitalWrite(todData4, (data & 0x10) ? HIGH : LOW);
+  digitalWrite(todData5, (data & 0x20) ? HIGH : LOW);
+  digitalWrite(todData6, (data & 0x40) ? HIGH : LOW);
+  digitalWrite(todData7, (data & 0x80) ? HIGH : LOW);
+}
+
+void outputTodParallel(const TodData& tod) {
+  // === ВЫВОД ВРЕМЕНИ ===
+  digitalWrite(todSelect, LOW); // Выбираем время
+  
+  // Пакет 1: Секунды + миллисекунды (младший байт)
+  uint16_t timeData1 = (tod.seconds << 8) | (tod.milliseconds & 0xFF);
+  outputDataToBus(timeData1);
+  digitalWrite(todStrobe, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(todStrobe, LOW);
+  delayMicroseconds(10);
+  
+  // Пакет 2: Часы + минуты
+  uint16_t timeData2 = (tod.hours << 8) | tod.minutes;
+  outputDataToBus(timeData2);
+  digitalWrite(todStrobe, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(todStrobe, LOW);
+  delayMicroseconds(10);
+  
+  // === ВЫВОД ДАТЫ ===
+  digitalWrite(todSelect, HIGH); // Выбираем дату
+  
+  // Пакет 3: День + месяц
+  uint16_t dateData1 = (tod.day << 8) | tod.month;
+  outputDataToBus(dateData1);
+  digitalWrite(todStrobe, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(todStrobe, LOW);
+  delayMicroseconds(10);
+  
+  // Пакет 4: Год (младшие 8 бит) + день недели
+  uint16_t dateData2 = ((tod.year & 0xFF) << 8) | tod.dayOfWeek;
+  outputDataToBus(dateData2);
+  digitalWrite(todStrobe, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(todStrobe, LOW);
+  delayMicroseconds(10);
+  
+  // Пакет 5: Старший байт года + статус
+  uint16_t dateData3 = ((tod.year >> 8) << 8) | (tod.ppsLocked ? 0x01 : 0x00);
+  outputDataToBus(dateData3);
+  digitalWrite(todStrobe, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(todStrobe, LOW);
+}
+
+void generateTodOutput(bool fromPps = false) {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("❌ Ошибка получения времени");
+    return;
+  }
+  
+  TodData tod;
+  // Время
+  tod.hours = timeinfo.tm_hour;
+  tod.minutes = timeinfo.tm_min;
+  tod.seconds = timeinfo.tm_sec;
+  tod.milliseconds = millis() % 1000;
+  
+  // Дата
+  tod.day = timeinfo.tm_mday;
+  tod.month = timeinfo.tm_mon + 1;
+  tod.year = timeinfo.tm_year + 1900;
+  tod.dayOfWeek = timeinfo.tm_wday;
+  
+  // Статус
+  tod.ppsCounter = ppsCounter;
+  
+  unsigned long sinceLastStable = micros() - lastStablePps;
+  tod.ppsLocked = (sinceLastStable < 2000000) && (stablePpsCount > 10);
+  
+  if (fromPps) {
+    updateTimeFromPps();
+    externalClockActive = true;
+  }
+  
+  // Вывод в Serial
+  outputTodSerial(tod);
+  
+  // Вывод в параллельном формате через один RJ45
+  outputTodParallel(tod);
+}
+
+void setupPins() {
+  // Настройка пинов для мультиплексированного TOD вывода
+  pinMode(todData0, OUTPUT);
+  pinMode(todData1, OUTPUT);
+  pinMode(todData2, OUTPUT);
+  pinMode(todData3, OUTPUT);
+  pinMode(todData4, OUTPUT);
+  pinMode(todData5, OUTPUT);
+  pinMode(todData6, OUTPUT);
+  pinMode(todData7, OUTPUT);
+  pinMode(todStrobe, OUTPUT);
+  pinMode(todSelect, OUTPUT);
+  
+  // Начальное состояние
+  digitalWrite(todStrobe, LOW);
+  digitalWrite(todSelect, LOW);
+  
+  // PPS вход
+  pinMode(ppsPin, INPUT_PULLUP);
+}
+
+void syncWithNtp() {
+  Serial.println("🔄 Синхронизация с NTP...");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  delay(2000);
+  lastNtpSync = millis();
+  
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    Serial.printf("✅ NTP: %04d-%02d-%02d %02d:%02d:%02d\n",
+                 timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                 timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("===== ESP32 Full TOD Multiplexed =====");
+  Serial.println("RJ45: GPIO12-19 (DATA), GPIO21 (STROBE), GPIO22 (SELECT)");
+  Serial.println("Protocol: 5 packets per second (Time + Date)");
+
+  setupPins();
+  attachInterrupt(digitalPinToInterrupt(ppsPin), ppsInterrupt, RISING);
+
+  WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, IPAddress(8, 8, 8, 8));
+  WiFi.begin(ssid, password);
+  
+  Serial.print("Подключение к WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi подключен");
+
+  syncWithNtp();
+  
+  Serial.println("🚀 Система запущена. Мультиплексированный TOD");
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  if (ppsReceived) {
+    ppsReceived = false;
+    generateTodOutput(true);
+  }
+  
+  static unsigned long lastModeCheck = 0;
+  if (currentMillis - lastModeCheck >= 1000) {
+    unsigned long sinceLastStable = micros() - lastStablePps;
+    
+    if (externalClockActive && sinceLastStable > 2500000) {
+      externalClockActive = false;
+      Serial.println("⚠️  Потеря стабильного PPS");
+    } else if (!externalClockActive && sinceLastStable < 1500000 && stablePpsCount > 5) {
+      externalClockActive = true;
+      Serial.println("✅ Восстановлен PPS режим");
+    }
+    lastModeCheck = currentMillis;
+  }
+  
+  static unsigned long lastFreeOutput = 0;
+  if (!externalClockActive && currentMillis - lastFreeOutput >= 1000) {
+    generateTodOutput(false);
+    lastFreeOutput = currentMillis;
+  }
+  
+  if (currentMillis - lastNtpSync > 1800000) {
+    syncWithNtp();
+  }
+  
+  delay(1);
+}
